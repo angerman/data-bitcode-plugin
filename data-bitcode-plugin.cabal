@@ -1,0 +1,40 @@
+-- This file has been generated from package.yaml by hpack version 0.14.1.
+--
+-- see: https://github.com/sol/hpack
+
+name:           data-bitcode-plugin
+version:        0.1.0.0
+synopsis:       bitcode plugin for ghc
+category:       Code Generation
+homepage:       https://github.com/angerman/data-bitcode-plugin#readme
+bug-reports:    https://github.com/angerman/data-bitcode-plugin/issues
+author:         Moritz Angermann <moritz@lichtzwerge.de>
+maintainer:     Moritz Angermann <moritz@lichtzwerge.de>
+copyright:      lichtzwerge GmbH
+license:        BSD3
+build-type:     Simple
+cabal-version:  >= 1.10
+
+source-repository head
+  type: git
+  location: https://github.com/angerman/data-bitcode-plugin
+
+library
+  hs-source-dirs:
+      src
+  build-depends:
+      base >= 4.7 && < 5
+    , pretty >= 1.1
+    , bytestring >= 0.10
+    , base16-bytestring
+    , ghc
+    , data-bitcode-edsl
+    , data-bitcode-llvm
+    , transformers
+  exposed-modules:
+      Cmm.Pretty
+      Llvm.Gen
+      Llvm.Monad
+      Playground
+      Plugin
+  default-language: Haskell2010

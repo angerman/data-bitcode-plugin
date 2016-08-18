@@ -1,0 +1,14 @@
+resolver: nightly-2016-08-06
+packages:
+- '.'
+- '../data-bitcode'
+- '../data-bitcode-llvm'
+- '../data-bitcode-edsl'
+
+extra-deps: []
+flags: {}
+extra-package-dbs: []
+ghc-options: 
+  "*": -fllvm
+system-ghc: true
+compiler: ghc-8.0.1

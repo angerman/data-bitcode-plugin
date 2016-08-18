@@ -1,0 +1,23 @@
+name: data-bitcode-plugin
+version: 0.1.0.0
+synopsis: bitcode plugin for ghc
+license: BSD3
+author: Moritz Angermann <moritz@lichtzwerge.de>
+maintainer: Moritz Angermann <moritz@lichtzwerge.de>
+copyright: lichtzwerge GmbH
+category: Code Generation
+
+github: angerman/data-bitcode-plugin
+
+dependencies:
+  - base >= 4.7 && < 5
+  - pretty >= 1.1
+  - bytestring >= 0.10
+  - base16-bytestring
+  - ghc
+  - data-bitcode-edsl
+  - data-bitcode-llvm
+  - transformers
+
+library:
+  source-dirs: src
