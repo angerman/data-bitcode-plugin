@@ -1,13 +1,13 @@
 {-# LANGUAGE GADTs, GeneralizedNewtypeDeriving, RecursiveDo, LambdaCase, FlexibleInstances, FlexibleContexts #-}
-module Llvm.Gen where
+module Data.BitCode.LLVM.Gen where
 
-import qualified Llvm.Monad as Llvm
+import qualified Data.BitCode.LLVM.Gen.Monad as Llvm
 import qualified EDSL.Monad as EDSL
 import qualified EDSL as EDSL
 import qualified Data.BitCode.LLVM.Classes.HasType as EDSL (ty)
 import qualified Data.BitCode.LLVM.Util as EDSL
 import EDSL ((-->))
-import Llvm.Monad (LlvmT, runLlvmT, LlvmEnv(..))
+import Data.BitCode.LLVM.Gen.Monad (LlvmT, runLlvmT, LlvmEnv(..))
 import EDSL.Monad (BodyBuilderT, execBodyBuilderT)
 import Data.BitCode.LLVM.Pretty (pretty)
 import Text.PrettyPrint
@@ -81,8 +81,10 @@ runLlvm dflags fp m = do
   let mod = EDSL.mod' "anon" (lefts decls) (rights decls)
   -- stop here for now!
 --  error . show $ pretty mod
-  liftIO . putStrLn $ show (pretty mod)
-  liftIO . putStrLn $ "Writing module (writeModule) ..."
+
+  -- TODO: FLAGS: if -drump-ast
+  -- liftIO . putStrLn $ show (pretty mod)
+
   EDSL.writeModule (fp ++ ".bc") mod
   putStrLn $ "Wrote " ++ fp ++ ".bc"
   return ()
@@ -185,11 +187,15 @@ llvmCodeGen' prc@(CmmProc{}) = do
     -- body <- genLlvmProc (CmmProc infos entry_lbl live graph) -- this is prc with modified live
     body <- basicBlocksCodeGen live blocks
 
+
+    -- TODO: FLAGS: -traceDefSigs
+    -- let sig = (fnSig dflags globalRegs)
+    -- show the pretty signature on definition. E.g. add `traceShow (pretty sig)` infront of (fnSig...)
+
     -- produce a ghc function.
     -- now run the BodyBuilder on it with the function arguments.
     -- Eventually producing an LlvmM value.
-    let sig = (fnSig dflags globalRegs)
-    fmap (Right . addPrefix) $ EDSL.ghcdefT lbl (traceShow (pretty sig) (fnSig dflags globalRegs)) (\args -> body args)
+    fmap (Right . addPrefix) $ EDSL.ghcdefT lbl (fnSig dflags globalRegs) (\args -> body args)
 
 llvmCodeGen' _ = panic "LlvmCodeGen': unhandled raw cmm group"
 
@@ -223,10 +229,7 @@ float W64 = EDSL.float64
 float W80 = EDSL.float80
 float W128 = EDSL.float128
 
-allocaLocalRegs (LocalReg id ty) = do
-  slot <- EDSL.alloca (fromCmmType ty) (EDSL.int32 1)
-  liftIO . putStrLn . show $ pretty slot
-  return slot
+allocaLocalRegs (LocalReg id ty) = EDSL.alloca (fromCmmType ty) (EDSL.int32 1)
 
 activeRegs :: DynFlags -> LiveGlobalRegs -> LiveGlobalRegs
 activeRegs dflags live = filter isLive (activeStgRegs (targetPlatform dflags))
@@ -335,10 +338,10 @@ genStaticLit = \case
 
 genLit :: BlockMap -> RegMap -> CmmLit -> BodyBuilder Symbol
 genLit blockMap regMap = \case
-  (CmmInt i w)   -> traceShow "genLitCmmInt" $ pure $ EDSL.int (widthInBits w) i
+  (CmmInt i w)   -> pure $ EDSL.int (widthInBits w) i
   (CmmFloat r w) -> panic $ "genLit: CmmFloat not supported!" -- pure $ EDSL.float
   (CmmVec ls)    -> panic $ "genLit: CmmVec not supported!"
-  (CmmLabel l)   -> traceShow "genLitCmmLabel" $ do
+  (CmmLabel l)   -> do
     lbl <- lift $ strCLabel_llvm l
     ty  <- lift $ tyCLabel_llvm l
     -- FIXME: We do a ptrToInt cast here, if ty is int. This
@@ -412,7 +415,8 @@ basicBlocksCodeGen live bs@(entryBlock:cmmBlocks) = do
   dflags <- getDynFlags
   let liveGlobalRegs = activeRegs dflags globalRegs
 
-  mapM showCmm liveGlobalRegs >>= liftIO . putStrLn . show
+  -- this shows the liveGlobalRegs names
+  -- mapM showCmm liveGlobalRegs >>= liftIO . putStrLn . show
 
   return $ \args -> mdo
     (eMap, regSlots) <-        entryBlockCodeGen liveGlobalRegs args    localRegs  idMap  entryBlock
@@ -476,40 +480,29 @@ lookup_ k = fromMaybe (panic "not found") . lookup k
 lookupGlobalReg g map = case lookup (CmmGlobal g) map of
   Just slot -> pure slot
   Nothing   -> do dflags <- getDynFlags
-                  traceStack "GR" $ panic $ "Failed to lookup global reg: " ++ showSDoc dflags (ppr g)
+                  panic $ "Failed to lookup global reg: " ++ showSDoc dflags (ppr g)
                   pure undefined
 
 lookupLocalReg l map = case lookup (CmmLocal l) map of
   Just slot -> pure slot
   Nothing   -> do dflags <- getDynFlags
-                  traceStack "LR" $ panic $ "Failed to lookup global reg: " ++ showSDoc dflags (ppr l)
+                  panic $ "Failed to lookup global reg: " ++ showSDoc dflags (ppr l)
                   pure undefined
 
 lookupReg (CmmGlobal g) = lookupGlobalReg g
 lookupReg (CmmLocal  l) = lookupLocalReg  l
 
-loadGlobalReg g map = do
-  r <- lookupGlobalReg g map
-  liftIO . putStrLn . show $ pretty r
-  slot <- EDSL.load r
-  liftIO . putStrLn . show $ pretty slot
-  return slot
+loadGlobalReg g map = lookupGlobalReg g map >>= EDSL.load
 loadLocalReg  l map = lookupLocalReg  l map >>= EDSL.load
 
 loadReg :: CmmReg -> RegMap -> BodyBuilder Symbol
-loadReg r m = do
-  showCmm r >>= (liftIO . putStrLn)
-  r' <- lookupReg r m
-  liftIO . putStrLn . show $ pretty r'
-  slot <- EDSL.load r'
-  liftIO . putStrLn . show $ pretty slot
-  return slot
+loadReg r m = lookupReg r m >>= EDSL.load
 
 -- | Convert a CmmStmt to a list of LlvmStatement's
 stmtToInstrs :: BlockMap -> RegMap -> CmmNode e x -> BodyBuilder ()
 stmtToInstrs blockMap regMap stmt = do
   dflags <- getDynFlags
-  liftIO . putStrLn $ "Compiling Cmm statement: " ++ showSDoc dflags (ppr stmt)
+  -- liftIO . putStrLn $ "Compiling Cmm statement: " ++ showSDoc dflags (ppr stmt)
   res <- case stmt of
     -- nuke these
     CmmComment _ -> pure ()
@@ -543,7 +536,7 @@ stmtToInstrs blockMap regMap stmt = do
     CmmCall { cml_target = target,
               cml_args_regs = live }
       | (CmmLit (CmmLabel lbl)) <- target -> do
-          liftIO . putStrLn $ "CmmCall"
+          -- liftIO . putStrLn $ "CmmCall"
           -- call a known function using a jump.
           fname <- lift $ strCLabel_llvm lbl
           fty   <- lift $ tyCLabel_llvm lbl
@@ -554,7 +547,7 @@ stmtToInstrs blockMap regMap stmt = do
           EDSL.retVoid
 
       | otherwise -> do
-          liftIO . putStrLn $ "CmmCall other"
+          -- liftIO . putStrLn $ "CmmCall other"
           s <- exprToVar blockMap regMap target
           fty <- flip fnSig live <$> (lift getDynFlags)
           f <- EDSL.intToPtr (EDSL.lift fty) s
@@ -646,7 +639,7 @@ genCall blockMap regMap target dsts args = case target of
   (PrimTarget (MO_Add2 w))       -> panic "genCall: Add2 not implemented"
   (PrimTarget (MO_SubWordC w))   -> panic "genCall: SubWordC not implemented"
   target                         -> do
-    liftIO $ putStrLn "Generic Call"
+    -- liftIO $ putStrLn "Generic Call"
     dflags <- getDynFlags
 
     -- parameter types
@@ -717,10 +710,9 @@ genCall blockMap regMap target dsts args = case target of
 
     -- store the result value
     case retTy of
-      Ty.Void   | length dsts == 0 -> traceShow "Void Call" $ call fn argVars >> pure ()
+      Ty.Void   | length dsts == 0 -> call fn argVars >> pure ()
                 | otherwise        -> panic $ "genCall: void result with register assignment!"
-      _         | [reg] <- dsts    -> traceShow "Non-Void Call" $
-                                      do Just res <- call fn argVars -- we *know* the function has a return value!
+      _         | [reg] <- dsts    -> do Just res <- call fn argVars -- we *know* the function has a return value!
                                          slot <- lookupLocalReg reg regMap
                                          -- TODO: this is quite cmplex. We now go ahead
                                          --       and store res -> slot, even though we
@@ -800,7 +792,7 @@ genStore_fast blockMap regMap addr r n val = do
       (ix, rem) = n `divMod` ((EDSL.size ptrSize slotTy) `div` 8)
   if EDSL.isPtr slotTy && rem == 0
     then do ptr <- EDSL.gep slot [EDSL.int32 ix]
-            liftIO . putStrLn $ "(genStore_fast)gep: " ++ show (pretty slot) ++ " at " ++ show ix ++ " -> " ++ show (pretty ptr)
+            -- liftIO . putStrLn $ "(genStore_fast)gep: " ++ show (pretty slot) ++ " at " ++ show ix ++ " -> " ++ show (pretty ptr)
             EDSL.store ptr val
     -- if its a bit type then we use the slow method since we
     -- can't avoid casting anyway.
@@ -817,16 +809,15 @@ genStore_slow blockMap regMap addrExpr val = do
 exprToVar :: BlockMap -> RegMap -> CmmExpr -> BodyBuilder Symbol
 exprToVar blockMap regMap = \case
   -- Literal
-  CmmLit lit         -> traceShow "genLit" $ genLit blockMap regMap lit
+  CmmLit lit         -> genLit blockMap regMap lit
   -- Read memory location
-  CmmLoad e' ty      -> traceShow "genLoad" $ genLoad blockMap regMap e' ty
+  CmmLoad e' ty      -> genLoad blockMap regMap e' ty
   -- Contents of register
-  CmmReg r           -> traceShow "loadReg" $ loadReg r regMap -- TODO, might need to cast to int, as Cmm expects ints. See getCmmReg
+  CmmReg r           -> loadReg r regMap -- TODO, might need to cast to int, as Cmm expects ints. See getCmmReg
   -- Machine operation
-  CmmMachOp op exprs -> traceShow "genMachOp" $ genMachOp blockMap regMap op exprs
+  CmmMachOp op exprs -> genMachOp blockMap regMap op exprs
   -- Expand the CmmRegOff shorthand.
-  CmmRegOff reg off  -> traceShow "regOff" $
-                        do dflags <- lift getDynFlags
+  CmmRegOff reg off  -> do dflags <- lift getDynFlags
                            let rep = typeWidth (cmmRegType dflags reg)
                              in exprToVar blockMap regMap $ CmmMachOp (MO_Add rep) [CmmReg reg, CmmLit (CmmInt (fromIntegral off) rep)]
   CmmStackSlot _ _   -> panic "exprToVar: CmmStackSlot not supported!"
@@ -918,9 +909,7 @@ genMachOp_fast blockMap regMap op r n e = do
   let slotTy = EDSL.ty slot
       (ix, rem) = n `divMod` ((EDSL.size ptrSize slotTy) `div` 8)
   if EDSL.isPtr slotTy && rem == 0
-    then do ptr <- EDSL.gep slot [EDSL.int32 ix]
-            liftIO . putStrLn $ "(genMachOp_fast)gep: " ++ show (pretty slot) ++ " at " ++ show ix ++ " -> " ++ show (pretty ptr)
-            return ptr
+    then EDSL.gep slot [EDSL.int32 ix]
     else genMachOp_slow blockMap regMap op e
 
 -- | Handle CmmMachOp expressions

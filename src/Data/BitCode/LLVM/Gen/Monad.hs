@@ -1,5 +1,5 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-module Llvm.Monad where
+module Data.BitCode.LLVM.Gen.Monad where
 
 import DynFlags
 import qualified Stream

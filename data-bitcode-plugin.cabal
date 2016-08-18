@@ -33,8 +33,8 @@ library
     , transformers
   exposed-modules:
       Cmm.Pretty
-      Llvm.Gen
-      Llvm.Monad
+      Data.BitCode.LLVM.Gen
+      Data.BitCode.LLVM.Gen.Monad
+      Data.BitCode.Plugin
       Playground
-      Plugin
   default-language: Haskell2010

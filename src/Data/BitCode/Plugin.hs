@@ -1,5 +1,4 @@
-{-# LANGUAGE GADTs #-}
-module Plugin (plugin) where
+module Data.BitCode.Plugin (plugin) where
 
 import DynFlags
 import Plugins
@@ -17,7 +16,7 @@ import Cmm.Pretty
 
 import DynFlags
 
-import Llvm.Gen (outputFn)
+import Data.BitCode.LLVM.Gen (outputFn)
 
 --------------------------------------------------------------------------------
 -- WARN: Do *not* define any symbols here that might conflict with GHC Symbols

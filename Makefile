@@ -1,6 +1,6 @@
 GHC=$(HOME)/opt/lib/ghc-8.0.1
 
-test-link:
+test-link: Test.ll.opt.bc stub.c
 	cc \
 	-I$(GHC)/include \
   -L$(GHC)/base-4.9.0.0 \
