@@ -16,7 +16,7 @@ import Cmm.Pretty
 
 import DynFlags
 
-import Data.BitCode.LLVM.Gen (outputFn)
+import Data.BitCode.LLVM.Gen (outputFn, phaseInputExt)
 
 --------------------------------------------------------------------------------
 -- WARN: Do *not* define any symbols here that might conflict with GHC Symbols
@@ -32,9 +32,19 @@ import Data.BitCode.LLVM.Gen (outputFn)
 -- NOTE: Not running traceShow here, results in a panic :(
 --       Running seq, doesn't help either :(
 installHook :: [CommandLineOption] -> DynFlags -> DynFlags
-installHook _ dflags = traceShow "..." $ dflags { hooks = addHook (hooks dflags) }
+installHook _ dflags = traceShow "..." $ dflags { hooks = addHook (hooks dflags)
+                                                -- this is essentially a hack.
+                                                -- we piggyback on the Llvm pipeline.
+                                                -- we could alternatively provide -fllvm.
+                                                -- TODO: fix DriverPipeline.hs to not
+                                                --       depend on hscPostBackendPhase.
+                                                --       And turn that into something more
+                                                --       generic.
+                                                , hscTarget = HscLlvm
+                                                }
   where
     addHook h = h { codeOutputHook = Just outputFn
+                  , phaseInputExtHook = Just phaseInputExt
                   }
 
 -- We are a plugin!

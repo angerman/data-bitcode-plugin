@@ -32,6 +32,8 @@ import Outputable as Outp hiding ((<+>), text, ($+$), int)
 import Stream           (Stream)
 import Module
 import DynFlags
+-- for phaseInputExt
+import DriverPhases (Phase(..))
 
 import qualified Stream
 -- debugging
@@ -85,8 +87,8 @@ runLlvm dflags fp m = do
   -- TODO: FLAGS: if -drump-ast
   -- liftIO . putStrLn $ show (pretty mod)
 
-  EDSL.writeModule (fp ++ ".bc") mod
-  putStrLn $ "Wrote " ++ fp ++ ".bc"
+  EDSL.writeModule fp mod
+  putStrLn $ "Wrote " ++ fp
   return ()
   where env = LlvmEnv { envDynFlags = dflags }
 
@@ -110,10 +112,21 @@ getLlvmPlatform = getDynFlag targetPlatform
 -- * Cmm Helper
 showCmm cmm = (\dflags -> showSDoc dflags (ppr cmm)) <$> getDynFlags
 
+
+--------------------------------------------------------------------------------
+-- Plugin Hook
+outputFn :: (DynFlags -> Module -> ModLocation -> FilePath -> Stream IO RawCmmGroup () -> [UnitId] -> IO ())
+         -> DynFlags -> Module -> ModLocation -> FilePath -> Stream IO RawCmmGroup () -> [UnitId] -> IO ()
+outputFn super dflags mod mloc fp cmm_stream pkg_deps = runLlvm dflags fp $ llvmCodeGen (Llvm.liftStream cmm_stream)
+
+
+phaseInputExt :: (Phase -> String) -> Phase -> String
+phaseInputExt super phase
+  | phase == LlvmOpt = "bc"
+  | otherwise = super phase
+
 --------------------------------------------------------------------------------
 -- Llvm Code gen
-outputFn :: DynFlags -> Module -> ModLocation -> FilePath -> Stream IO RawCmmGroup () -> IO ()
-outputFn dflags mod mloc fp cmm_stream = runLlvm dflags fp $ llvmCodeGen (Llvm.liftStream cmm_stream)
 
 llvmCodeGen :: Stream.Stream LlvmM RawCmmGroup () -> LlvmM [Either Symbol Func.Function]
 llvmCodeGen cmm_stream = do
