@@ -25,6 +25,8 @@ import Hoopl
 import Control.Monad.IO.Class
 import Control.Monad.Trans.State
 import Control.Monad.Trans.Class
+import Control.Monad.Trans.Except (runExceptT, ExceptT, throwE)
+
 
 import Outputable as Outp hiding ((<+>), text, ($+$), int)
 
@@ -93,9 +95,13 @@ runLlvm dflags fp m = do
   where env = LlvmEnv { envDynFlags = dflags }
 
 type BodyBuilder a = BodyBuilderT LlvmM a
+type Edsl a = EDSL.EdslT LlvmM a
 
 instance HasDynFlags (BodyBuilderT LlvmM) where
   getDynFlags = lift getDynFlags
+
+-- instance HasDynFlags (ExceptT e (BodyBuilderT LlvmM)) where
+--  getDynFlags = lift getDynFlags
 
 --------------------------------------------------------------------------------
 -- * Lifted functions
@@ -112,13 +118,11 @@ getLlvmPlatform = getDynFlag targetPlatform
 -- * Cmm Helper
 showCmm cmm = (\dflags -> showSDoc dflags (ppr cmm)) <$> getDynFlags
 
-
 --------------------------------------------------------------------------------
 -- Plugin Hook
 outputFn :: (DynFlags -> Module -> ModLocation -> FilePath -> Stream IO RawCmmGroup () -> [UnitId] -> IO ())
          -> DynFlags -> Module -> ModLocation -> FilePath -> Stream IO RawCmmGroup () -> [UnitId] -> IO ()
 outputFn super dflags mod mloc fp cmm_stream pkg_deps = runLlvm dflags fp $ llvmCodeGen (Llvm.liftStream cmm_stream)
-
 
 phaseInputExt :: (Phase -> String) -> Phase -> String
 phaseInputExt super phase
@@ -148,7 +152,9 @@ llvmGroupGen :: RawCmmGroup -> LlvmM [Either Symbol Func.Function]
 llvmGroupGen = mapM llvmCodeGen'
 
 llvmCodeGen' :: RawCmmDecl -> LlvmM (Either Symbol Func.Function)
-llvmCodeGen' dat@(CmmData{}) = Left <$> genLlvmData dat
+llvmCodeGen' dat@(CmmData{}) = genLlvmData dat >>= \case
+  Right d -> pure (Left d)
+  Left e -> panic $ "Error generating code gen:\n" ++ e
 llvmCodeGen' prc@(CmmProc{}) = do
     -- rewrite assignments to global regs
     dflags <- getDynFlag id
@@ -175,7 +181,9 @@ llvmCodeGen' prc@(CmmProc{}) = do
       Nothing -> return Nothing
       Just (Statics _ statics) -> do
         infoStatics <- mapM genData statics
-        return $ Just $ EDSL.struct infoStatics
+        return $ Just $ case EDSL.struct <$> sequence infoStatics of
+          Right d -> d
+          Left e -> panic $ "Error while compiling prefix data:\n" ++ e
 
     let addPrefix = fromMaybe id (EDSL.withPrefixData <$> prefix)
 
@@ -208,7 +216,9 @@ llvmCodeGen' prc@(CmmProc{}) = do
     -- produce a ghc function.
     -- now run the BodyBuilder on it with the function arguments.
     -- Eventually producing an LlvmM value.
-    fmap (Right . addPrefix) $ EDSL.ghcdefT lbl (fnSig dflags globalRegs) (\args -> body args)
+    runExceptT (EDSL.ghcdefT lbl (fnSig dflags globalRegs) (\args -> body args)) >>= \case
+      Right f -> pure . Right . addPrefix $ f
+      Left e -> panic $ "Error while compiling " ++ lbl ++ "\n" ++ e
 
 llvmCodeGen' _ = panic "LlvmCodeGen': unhandled raw cmm group"
 
@@ -303,7 +313,7 @@ llvmFunArgs dflags live = map regType (activeRegs dflags live)
 --        | CmmBlock BlockId                    -- code label
 --        | CmmHighStackMark                    -- This will *not* be supported!
 
-genLlvmData :: RawCmmDecl -> LlvmM Symbol
+genLlvmData :: RawCmmDecl -> LlvmM (Either EDSL.Error Symbol)
 genLlvmData (CmmData section statics) = genStatics statics
   -- TODO: We irgnore the section right now.
   -- We will turn [CmmStatic] into a Struct.
@@ -313,61 +323,78 @@ genLlvmData (CmmData section statics) = genStatics statics
   -- infoStatics <- mapM genData statics
   -- return $ Just $ EDSL.struct infoStatics
 
-genStatics :: CmmStatics -> LlvmM Symbol
+genStatics :: CmmStatics -> LlvmM (Either EDSL.Error Symbol)
 genStatics (Statics l statics) = do
-  body <- EDSL.struct' <$> mapM genData statics
+  body <- liftM sequence (mapM genData statics)
   lbl  <- strCLabel_llvm l
   ty   <- tyCLabel_llvm l
   -- similarly to the genStaticLit, we will turn the
   -- ptr into an int.
-  pure $ EDSL.global lbl body
+  pure $ EDSL.global lbl . EDSL.struct' <$> body
 
-genData :: CmmStatic -> LlvmM Symbol
-genData (CmmString str) = return . EDSL.cStrS $ map (toEnum . fromIntegral) str
-genData (CmmUninitialised bytes) = panic $ "genData: Uninitialised " ++ show bytes ++ " bytes"
+genData :: CmmStatic -> LlvmM (Either EDSL.Error Symbol)
+genData (CmmString str) = return . pure . EDSL.cStrS $ map (toEnum . fromIntegral) str
+genData (CmmUninitialised bytes) = pure . Left $ "genData: Uninitialised " ++ show bytes ++ " bytes"
 genData (CmmStaticLit lit) = genStaticLit lit
 
 -- | Generate llvm code for a static literal
 --
 -- Will either generate the code or leave it unresolved if it is a 'CLabel'
 -- which isn't yet known.
-genStaticLit :: CmmLit -> LlvmM Symbol
+genStaticLit :: CmmLit -> LlvmM (Either EDSL.Error Symbol)
 genStaticLit = \case
-  (CmmInt i w)   -> pure $ EDSL.int (widthInBits w) i
-  (CmmFloat r w) -> panic $ "genStaticLit: CmmFloat not supported!"
-  (CmmVec ls)    -> panic $ "genStaticLit: CmmVec not supported!"
+  (CmmInt i w)   -> pure . Right $ EDSL.int (widthInBits w) i
+  (CmmFloat r w) -> pure . Left $ "genStaticLit: CmmFloat not supported!"
+  (CmmVec ls)    -> pure . Left $ "genStaticLit: CmmVec not supported!"
   (CmmLabel l)   -> do
     lbl <- strCLabel_llvm l
     ty  <- tyCLabel_llvm l
     return $ EDSL.ptrToIntC ty (EDSL.label lbl (EDSL.lift ty))
   (CmmLabelOff l off) | off == 0  -> genStaticLit (CmmLabel l)
-                      | otherwise -> EDSL.addC <$> (flip EDSL.int off <$> ((*8) . wORD_SIZE <$> getDynFlags)) <*> genStaticLit (CmmLabel l)
-  (CmmLabelDiffOff l1 l2 off) | off == 0  -> EDSL.subC <$> genStaticLit (CmmLabel l1) <*> genStaticLit (CmmLabel l2)
-                              | otherwise -> EDSL.addC <$> (flip EDSL.int off <$> ((*8) . wORD_SIZE <$> getDynFlags))
-                                                       <*> (EDSL.subC <$> genStaticLit (CmmLabel l1) <*> genStaticLit (CmmLabel l2))
-  (CmmBlock b)   -> panic $ "genStaticLit: CmmBlock not supported!"
-  CmmHighStackMark -> panic $ "genStaticLit: CmmHighStackMark unsupported!"
-  _                -> panic $ "genStaticLit: unsupported lit!"
+                      | otherwise -> do
+                          size <- (*8) . wORD_SIZE <$> getDynFlags
+                          let n = EDSL.int size off
+                          l'   <- genStaticLit (CmmLabel l)
+                          pure $ join $ EDSL.addC n <$> l'
+  (CmmLabelDiffOff l1 l2 off) | off == 0  -> do
+                                  l1' <- genStaticLit (CmmLabel l1)
+                                  l2' <- genStaticLit (CmmLabel l2)
+                                  pure . join $ EDSL.subC <$> l1' <*> l2'
+                              | otherwise -> do
+                                  size <- (*8) . wORD_SIZE <$> getDynFlags
+                                  let n = EDSL.int size off
+                                  l1' <- genStaticLit (CmmLabel l1)
+                                  l2' <- genStaticLit (CmmLabel l2)
+                                  pure . join $ EDSL.addC n <$> (join $ EDSL.subC <$> l1' <*> l2')
 
-genLit :: BlockMap -> RegMap -> CmmLit -> BodyBuilder Symbol
+  (CmmBlock b)     -> pure . Left $ "genStaticLit: CmmBlock not supported!"
+  CmmHighStackMark -> pure . Left $ "genStaticLit: CmmHighStackMark unsupported!"
+  _                -> pure . Left $ "genStaticLit: unsupported lit!"
+
+genLit :: BlockMap -> RegMap -> CmmLit -> Edsl Symbol
 genLit blockMap regMap = \case
   (CmmInt i w)   -> pure $ EDSL.int (widthInBits w) i
-  (CmmFloat r w) -> panic $ "genLit: CmmFloat not supported!" -- pure $ EDSL.float
-  (CmmVec ls)    -> panic $ "genLit: CmmVec not supported!"
+  (CmmFloat r w) -> throwE "genLit: CmmFloat not supported!" -- pure $ EDSL.float
+  (CmmVec ls)    -> throwE "genLit: CmmVec not supported!"
   (CmmLabel l)   -> do
-    lbl <- lift $ strCLabel_llvm l
-    ty  <- lift $ tyCLabel_llvm l
+    lbl <- lift . lift $ strCLabel_llvm l
+    ty  <- lift . lift $ tyCLabel_llvm l
     -- FIXME: We do a ptrToInt cast here, if ty is int. This
     --        should better be done at the resolution site
     --        but we are not in the BodyBuilder at that point.
     if EDSL.isPtr ty
       then return $ EDSL.label lbl ty
       else EDSL.ptrToInt ty (EDSL.label lbl (EDSL.lift ty))
-  (CmmLabelOff l o) -> panic $ "genLit: CmmLabelOff not supported!"
-  (CmmLabelDiffOff l1 l2 off) -> panic $ "genLit: CmmLabelDiffOff not supported!"
-  (CmmBlock b) -> panic $ "genLit: CmmBlock not supported!"
-  CmmHighStackMark -> panic $ "genLit: CmmHighStackMark unsupported!"
-  l              -> panic $ "genLit: unsupported lit!"
+  (CmmLabelOff l o) -> do
+    liftIO . putStrLn . show =<< showCmm (CmmLabelOff l o)
+    width <- (*8) . wORD_SIZE <$> getDynFlags
+    lbl   <- genLit blockMap regMap (CmmLabel l)
+    let off = EDSL.int width o
+    EDSL.add lbl off
+  (CmmLabelDiffOff l1 l2 off) -> throwE "genLit: CmmLabelDiffOff not supported!"
+  (CmmBlock b)                -> throwE "genLit: CmmBlock not supported!"
+  CmmHighStackMark            -> throwE "genLit: CmmHighStackMark unsupported!"
+  l                           -> throwE "genLit: unsupported lit!"
 
 --------------------------------------------------------------------------------
 -- * Procs
@@ -388,7 +415,7 @@ tyCLabel_llvm lbl = do
   return $ fromCmmType ltype
 
 
-genLlvmProc :: RawCmmDecl -> LlvmM ([Symbol] -> BodyBuilder ())
+genLlvmProc :: RawCmmDecl -> LlvmM ([Symbol] -> Edsl ())
 genLlvmProc (CmmProc infos lbl live graph) = do
   let blocks = toBlockListEntryFirstFalseFallthrough graph
   basicBlocksCodeGen live blocks
@@ -405,7 +432,7 @@ getTrashRegs = do plat <- getLlvmPlatform
 -- optimization pass will perform the actual register allocation
 -- for us.
 --
-basicBlocksCodeGen :: LiveGlobalRegs -> [CmmBlock] -> LlvmM ([Symbol] -> BodyBuilder ())
+basicBlocksCodeGen :: LiveGlobalRegs -> [CmmBlock] -> LlvmM ([Symbol] -> Edsl ())
 basicBlocksCodeGen live bs@(entryBlock:cmmBlocks) = do
   -- insert the function prologue, containing the
   -- local registers available.  As we generate typed
@@ -446,7 +473,7 @@ entryBlockCodeGen :: LiveGlobalRegs
                   -> [LocalReg]       -- ^ a set of local registerst that will get assigned.
                   -> BlockMap
                   -> CmmBlock
-                  -> BodyBuilder (BlockMapEntry, RegMap)
+                  -> Edsl (BlockMapEntry, RegMap)
 entryBlockCodeGen live args localRegs idMap block = do
   let (_, nodes, tail) = blockSplit block
       id = entryLabel block
@@ -471,7 +498,7 @@ basicBlockCodeGen :: LiveGlobalRegs                                       -- ^ l
                   -> RegMap                                               -- ^ Register -> Reference map.
                   -> BlockMap                                             -- ^ a map of BlockLabel -> BlockId
                   -> CmmBlock                                             -- ^ the actual block to assemble.
-                  -> BodyBuilder BlockMapEntry
+                  -> Edsl BlockMapEntry
 basicBlockCodeGen live regMap idMap block = do
   let (_, nodes, tail) = blockSplit block
       id = entryLabel block
@@ -482,7 +509,7 @@ basicBlockCodeGen live regMap idMap block = do
     _ <- stmtToInstrs idMap regMap tail
     pure ()
 -- | Convert a list of CmmNode's to LlvmStatement's
-stmtsToInstrs :: BlockMap -> RegMap -> [CmmNode e x] -> BodyBuilder ()
+stmtsToInstrs :: BlockMap -> RegMap -> [CmmNode e x] -> Edsl ()
 stmtsToInstrs blockMap regMap stmts =  mapM_ (stmtToInstrs blockMap regMap) stmts
 
 
@@ -508,11 +535,11 @@ lookupReg (CmmLocal  l) = lookupLocalReg  l
 loadGlobalReg g map = lookupGlobalReg g map >>= EDSL.load
 loadLocalReg  l map = lookupLocalReg  l map >>= EDSL.load
 
-loadReg :: CmmReg -> RegMap -> BodyBuilder Symbol
+loadReg :: CmmReg -> RegMap -> Edsl Symbol
 loadReg r m = lookupReg r m >>= EDSL.load
 
 -- | Convert a CmmStmt to a list of LlvmStatement's
-stmtToInstrs :: BlockMap -> RegMap -> CmmNode e x -> BodyBuilder ()
+stmtToInstrs :: BlockMap -> RegMap -> CmmNode e x -> Edsl ()
 stmtToInstrs blockMap regMap stmt = do
   dflags <- getDynFlags
   -- liftIO . putStrLn $ "Compiling Cmm statement: " ++ showSDoc dflags (ppr stmt)
@@ -551,8 +578,8 @@ stmtToInstrs blockMap regMap stmt = do
       | (CmmLit (CmmLabel lbl)) <- target -> do
           -- liftIO . putStrLn $ "CmmCall"
           -- call a known function using a jump.
-          fname <- lift $ strCLabel_llvm lbl
-          fty   <- lift $ tyCLabel_llvm lbl
+          fname <- lift . lift $ strCLabel_llvm lbl
+          fty   <- lift . lift $ tyCLabel_llvm lbl
           fty'  <- flip fnSig live <$> (lift getDynFlags)
           -- Let's ignore this for now, and just always generate the full type.
           -- unless (fty == fty') $ panic $ "types do not match for fn " ++ show fname ++"!\n  fty: " ++ show fty ++ "\n  fty': " ++ show fty'
@@ -577,7 +604,7 @@ alwaysLive = [BaseReg, Sp, Hp, SpLim, HpLim, node] -- node is in CmmExpr.
 
 funArgs :: BlockMap -> RegMap
         -> LiveGlobalRegs
-        -> BodyBuilder [Symbol]
+        -> Edsl [Symbol]
 funArgs blockMap regMap live = do
 
   let liveRegs = alwaysLive ++ live
@@ -594,7 +621,7 @@ funArgs blockMap regMap live = do
 
   -- XXX platform dependence!
   -- TODO: We always load *all* regs.
-  platform <- lift $ getDynFlag targetPlatform
+  platform <- lift . lift $ getDynFlag targetPlatform
   loads <- flip mapM (filter (not . isSSE) (activeStgRegs platform)) $ \case
     r | r `elem` liveRegs -> loadGlobalReg r regMap
       | not (isSSE r)     -> pure $ EDSL.undef (fromCmmType (globalRegType dflags r))
@@ -605,7 +632,7 @@ funArgs blockMap regMap live = do
 -- Calling a foreign function
 genCall :: BlockMap -> RegMap
         -> ForeignTarget -> [CmmFormal] -> [CmmActual]
-        -> BodyBuilder ()
+        -> Edsl ()
 genCall blockMap regMap target dsts args = case target of
   -- TODO: Insert Fence instruction if needed, or can we simply insert one
   --       for each platform, and LLVM will ignore where not needed?
@@ -748,10 +775,10 @@ genCall blockMap regMap target dsts args = case target of
                 | otherwise        -> panic $ "genCall: Bad number of registers! Can only handle"
                                            ++ " 1, given " ++ show (length dsts) ++ "."
 
-getFunPtr :: Ty.Ty -> ForeignTarget -> BodyBuilder Symbol
+getFunPtr :: Ty.Ty -> ForeignTarget -> Edsl Symbol
 getFunPtr ty = \case
   ForeignTarget (CmmLit (CmmLabel lbl)) _ -> do
-    lbl <- lift $ strCLabel_llvm lbl
+    lbl <- lift . lift $ strCLabel_llvm lbl
     return $ EDSL.fun lbl ty
   ForeignTarget expr _ -> panic "getFunPtr \\w expr"
   PrimTarget mop -> panic "getFunPtr \\w primOp"
@@ -760,7 +787,7 @@ getFunPtr ty = \case
 -- genStore --------------------------------------------------------------------
 -- TODO: WIP!
 -- | CmmStore operation
-genStore :: BlockMap -> RegMap -> CmmExpr -> CmmExpr -> BodyBuilder ()
+genStore :: BlockMap -> RegMap -> CmmExpr -> CmmExpr -> Edsl ()
 -- First we try to detect a few common cases and produce better code for
 -- these then the default case. We are mostly trying to detect Cmm code
 -- like I32[Sp + n] and use 'getelementptr' operations instead of the
@@ -785,7 +812,7 @@ genStore blockMap regMap addrE val = case addrE of
 -- offset such as I32[Sp+8].
 genStore_fast :: BlockMap -> RegMap
               -> CmmExpr -> GlobalReg -> Int -> Symbol
-              -> BodyBuilder ()
+              -> Edsl ()
 genStore_fast blockMap regMap addr r n val = do
   -- ptrSize (ptrs are the size of words)
   ptrSize <- (*8) . wORD_SIZE <$> (lift getDynFlags)
@@ -819,7 +846,7 @@ genStore_slow blockMap regMap addrExpr val = do
 --------------------------------------------------------------------------------
 -- * CmmExpr code generation
 
-exprToVar :: BlockMap -> RegMap -> CmmExpr -> BodyBuilder Symbol
+exprToVar :: BlockMap -> RegMap -> CmmExpr -> Edsl Symbol
 exprToVar blockMap regMap = \case
   -- Literal
   CmmLit lit         -> genLit blockMap regMap lit
@@ -839,7 +866,7 @@ exprToVar blockMap regMap = \case
 -- TODO: We might also want to short cut ((Reg +/- N) +/- M)
 --       Instead of getting the relative offset of R and then
 --       computing ptrToInt -> add/sub -> intToPtr.
-genLoad :: BlockMap -> RegMap -> CmmExpr -> CmmType -> BodyBuilder Symbol
+genLoad :: BlockMap -> RegMap -> CmmExpr -> CmmType -> Edsl Symbol
 genLoad blockMap regMap e ty = case e of
   (CmmReg (CmmGlobal r))        -> genLoad_fast' e r 0 ty
   (CmmRegOff (CmmGlobal r) n)   -> genLoad_fast' e r n ty
@@ -855,7 +882,7 @@ genLoad blockMap regMap e ty = case e of
 
 genLoad_fast :: BlockMap -> RegMap
              -> CmmExpr -> GlobalReg -> Int -> CmmType
-             -> BodyBuilder Symbol
+             -> Edsl Symbol
 genLoad_fast blockMap regMap e r n ty = do
   ptrSize <- (*8) <$> wORD_SIZE <$> (lift getDynFlags)
   slot <- lookupGlobalReg r regMap
@@ -887,7 +914,7 @@ genLoad_fast blockMap regMap e r n ty = do
 
 genLoad_slow :: BlockMap -> RegMap
              -> CmmExpr -> CmmType
-             -> BodyBuilder Symbol
+             -> Edsl Symbol
 genLoad_slow blockMap regMap e ty = do
   ptr <- exprToVar blockMap regMap e
   e' <- showCmm e
@@ -898,7 +925,7 @@ genLoad_slow blockMap regMap e ty = do
          then EDSL.load ptr
          else panic $ "genLoad_slow not implemented, expr: " ++ e' ++ "("++ ty' ++ ")" ++ " -> " ++ show ptr
 
-genMachOp :: BlockMap -> RegMap -> MachOp -> [CmmExpr] -> BodyBuilder Symbol
+genMachOp :: BlockMap -> RegMap -> MachOp -> [CmmExpr] -> Edsl Symbol
 genMachOp blockMap regMap op [x] = panicOp
   -- case op of
   -- _        -> panicOp
@@ -928,7 +955,7 @@ genMachOp_fast blockMap regMap op r n e = do
 -- | Handle CmmMachOp expressions
 -- This handles all the cases not handle by the specialised genMachOp_fast.
 -- Element extraction
-genMachOp_slow :: BlockMap -> RegMap -> MachOp -> [CmmExpr] -> BodyBuilder Symbol
+genMachOp_slow :: BlockMap -> RegMap -> MachOp -> [CmmExpr] -> Edsl Symbol
 -- genMachOp_slow blockMap regMap (MO_V_Extract  l w) [val, idx] = return
 -- genMachOp_slow blockMap regMap (MO_VF_Extract l w) [val, idx] = return
 -- -- Element insertion
@@ -944,7 +971,6 @@ genMachOp_slow blockMap regMap op [x, y] = case op of
       lhs <- exprToVar blockMap regMap x
       rhs <- exprToVar blockMap regMap y
       EDSL.ineq lhs rhs
-
     MO_S_Gt _ -> do
       lhs <- exprToVar blockMap regMap x
       rhs <- exprToVar blockMap regMap y
@@ -1069,7 +1095,10 @@ genMachOp_slow blockMap regMap op [x, y] = case op of
 
     _            -> panicOp
     where
-        panicOp = panic $ "LLVM.CodeGen.genMachOp_slow: unary op encountered"
-                       ++ "with two arguments! (" ++ show op ++ ")"
+      lowerIfNeeded :: Symbol -> Edsl Symbol
+      lowerIfNeeded x | EDSL.isPtr (EDSL.ty x) = EDSL.ptrToInt (EDSL.lower (EDSL.ty x)) x
+                      | otherwise = return x
+      panicOp = panic $ "LLVM.CodeGen.genMachOp_slow: unary op encountered"
+                ++ "with two arguments! (" ++ show op ++ ")"
 
 genMachOp_slow blockMap regMap op e = panic $ "genMachOp_slow not supported for (" ++ show op ++ ")."
