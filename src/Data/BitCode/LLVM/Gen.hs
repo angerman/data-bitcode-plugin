@@ -984,21 +984,20 @@ genMachOp_slow blockMap regMap op [x, y] = case op of
       rhs <- exprToVar blockMap regMap y
       EDSL.islt lhs rhs
     MO_S_Le _ -> do
-      lhs <- exprToVar blockMap regMap x
-      rhs <- exprToVar blockMap regMap y
+      lhs <- lowerIfNeeded =<< exprToVar blockMap regMap x
+      rhs <- lowerIfNeeded =<< exprToVar blockMap regMap y
       EDSL.isle lhs rhs
-
     MO_U_Gt _ -> do
-      lhs <- exprToVar blockMap regMap x
-      rhs <- exprToVar blockMap regMap y
+      lhs <- lowerIfNeeded =<< exprToVar blockMap regMap x
+      rhs <- lowerIfNeeded =<< exprToVar blockMap regMap y
       EDSL.iugt lhs rhs
     MO_U_Ge _ -> do
       lhs <- exprToVar blockMap regMap x
       rhs <- exprToVar blockMap regMap y
       EDSL.iuge lhs rhs
     MO_U_Lt _ -> do
-      lhs <- exprToVar blockMap regMap x
-      rhs <- exprToVar blockMap regMap y
+      lhs <- lowerIfNeeded =<< exprToVar blockMap regMap x
+      rhs <- lowerIfNeeded =<< exprToVar blockMap regMap y
       EDSL.iult lhs rhs
     MO_U_Le _ -> do
       lhs <- exprToVar blockMap regMap x
@@ -1006,8 +1005,8 @@ genMachOp_slow blockMap regMap op [x, y] = case op of
       EDSL.iule lhs rhs
 
     MO_Add _ -> do
-      lhs <- exprToVar blockMap regMap x
-      rhs <- exprToVar blockMap regMap y
+      lhs <- lowerIfNeeded =<< exprToVar blockMap regMap x
+      rhs <- lowerIfNeeded =<< exprToVar blockMap regMap y
       EDSL.add lhs rhs
     MO_Sub _ -> do
       lhs <- exprToVar blockMap regMap x
