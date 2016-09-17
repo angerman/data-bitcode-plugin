@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, GeneralizedNewtypeDeriving, RecursiveDo, LambdaCase, FlexibleInstances, FlexibleContexts #-}
+{-# LANGUAGE GADTs, GeneralizedNewtypeDeriving, RecursiveDo, LambdaCase, FlexibleInstances, FlexibleContexts, StandaloneDeriving #-}
 module Data.BitCode.LLVM.Gen where
 
 import qualified Data.BitCode.LLVM.Gen.Monad as Llvm
@@ -25,17 +25,10 @@ import Hoopl
 import Control.Monad.IO.Class
 import Control.Monad.Trans.State
 import Control.Monad.Trans.Class
-import Control.Monad.Trans.Except (runExceptT, ExceptT, throwE)
+import Control.Monad.Trans.Except (runExceptT, ExceptT, throwE, catchE)
 
 
 import Outputable as Outp hiding ((<+>), text, ($+$), int)
-
--- for outputfn
-import Stream           (Stream)
-import Module
-import DynFlags
--- for phaseInputExt
-import DriverPhases (Phase(..))
 
 import qualified Stream
 -- debugging
@@ -50,6 +43,8 @@ import Platform
 import CodeGen.Platform ( activeStgRegs, callerSaves )
 
 import ForeignCall
+
+import DynFlags
 
 -- body builder
 import Data.BitCode.LLVM.Instruction (Inst)
@@ -80,7 +75,7 @@ instance HasDynFlags LlvmM where
 
 runLlvm :: DynFlags -> FilePath -> LlvmM [Either Symbol Func.Function] -> IO ()
 runLlvm dflags fp m = do
-  putStrLn $ "File: " ++ fp
+  putStrLn $ "Output File: " ++ fp
   decls <- flip evalStateT env (runLlvmT (unLlvmM m))
   let mod = EDSL.mod' "anon" (lefts decls) (rights decls)
   -- stop here for now!
@@ -117,17 +112,6 @@ getLlvmPlatform = getDynFlag targetPlatform
 --------------------------------------------------------------------------------
 -- * Cmm Helper
 showCmm cmm = (\dflags -> showSDoc dflags (ppr cmm)) <$> getDynFlags
-
---------------------------------------------------------------------------------
--- Plugin Hook
-outputFn :: (DynFlags -> Module -> ModLocation -> FilePath -> Stream IO RawCmmGroup () -> [UnitId] -> IO ())
-         -> DynFlags -> Module -> ModLocation -> FilePath -> Stream IO RawCmmGroup () -> [UnitId] -> IO ()
-outputFn super dflags mod mloc fp cmm_stream pkg_deps = runLlvm dflags fp $ llvmCodeGen (Llvm.liftStream cmm_stream)
-
-phaseInputExt :: (Phase -> String) -> Phase -> String
-phaseInputExt super phase
-  | phase == LlvmOpt = "bc"
-  | otherwise = super phase
 
 --------------------------------------------------------------------------------
 -- Llvm Code gen
@@ -386,7 +370,7 @@ genLit blockMap regMap = \case
       then return $ EDSL.label lbl ty
       else EDSL.ptrToInt ty (EDSL.label lbl (EDSL.lift ty))
   (CmmLabelOff l o) -> do
-    liftIO . putStrLn . show =<< showCmm (CmmLabelOff l o)
+    -- liftIO . putStrLn . show =<< showCmm (CmmLabelOff l o)
     width <- (*8) . wORD_SIZE <$> getDynFlags
     lbl   <- genLit blockMap regMap (CmmLabel l)
     let off = EDSL.int width o
@@ -538,11 +522,25 @@ loadLocalReg  l map = lookupLocalReg  l map >>= EDSL.load
 loadReg :: CmmReg -> RegMap -> Edsl Symbol
 loadReg r m = lookupReg r m >>= EDSL.load
 
+bclog :: String -> Edsl ()
+bclog msg = do
+  s <- EDSL.gep (EDSL.global "log" (EDSL.cStr msg)) [EDSL.int32 0, EDSL.int32 0]
+  _ <- EDSL.ccall (EDSL.fun "puts" ([EDSL.i8ptr] --> EDSL.i32)) [s]
+  return ()
+
 -- | Convert a CmmStmt to a list of LlvmStatement's
 stmtToInstrs :: BlockMap -> RegMap -> CmmNode e x -> Edsl ()
-stmtToInstrs blockMap regMap stmt = do
+stmtToInstrs blockMap regMap stmt = flip catchE (\e -> showCmm stmt >>= \stmt -> throwE $ "in cmm stmt: " ++ stmt ++ "\n" ++ e) $ do
   dflags <- getDynFlags
   -- liftIO . putStrLn $ "Compiling Cmm statement: " ++ showSDoc dflags (ppr stmt)
+  stmt' <- showCmm stmt
+  -- DEBUG
+  -- bclog embeds the cmm statement directly into the output stream.
+  --       therfore the evaluated cmm statement will be printed right
+  --       before the synthesized bitcode is executed.
+  -- --
+  -- bclog stmt'
+
   res <- case stmt of
     -- nuke these
     CmmComment _ -> pure ()
@@ -550,23 +548,23 @@ stmtToInstrs blockMap regMap stmt = do
     CmmUnwind {} -> pure () -- not yet supported
 
     -- CmmReg -> CmmExpr
-    CmmAssign reg src -> do
-      slot <- lookupReg reg regMap
-      var <- exprToVar blockMap regMap src
-      EDSL.store slot var
+    CmmAssign reg src -> genAssign blockMap regMap reg src
+      -- slot <- lookupReg reg regMap
+      -- var <- exprToVar blockMap regMap src
+      -- EDSL.store slot var
 
     -- CmmExpr -> CmmExpr
     CmmStore addr src -> genStore blockMap regMap addr src
 
     -- ULabel
-    CmmBranch id      -> panic "stmtToInstrs: CmmBranch not supported!"
+    CmmBranch id      -> EDSL.ubr (lookup_ id blockMap) >> pure ()
     -- CmmExpr -> ULabel -> ULabel -> Maybe Bool
     CmmCondBranch cond true false hint -> do
       c <- exprToVar blockMap regMap cond
       EDSL.br c (lookup_ true blockMap) (lookup_ false blockMap)
       pure ()
     -- CmmExpr -> SwitchTargets
-    CmmSwitch cond ids -> panic "stmtToInstrs: CmmSwitch not supported!"
+    CmmSwitch cond ids -> throwE "stmtToInstrs: CmmSwitch not supported!"
 
     -- Foreign call
     -- ForeignTarget -> [CmmFormal] -> [CmmActual]
@@ -576,7 +574,7 @@ stmtToInstrs blockMap regMap stmt = do
     CmmCall { cml_target = target,
               cml_args_regs = live }
       | (CmmLit (CmmLabel lbl)) <- target -> do
-          -- liftIO . putStrLn $ "CmmCall"
+          -- liftIO . putStrLn $ "CmmCall: " ++ stmt'
           -- call a known function using a jump.
           fname <- lift . lift $ strCLabel_llvm lbl
           fty   <- lift . lift $ tyCLabel_llvm lbl
@@ -587,14 +585,14 @@ stmtToInstrs blockMap regMap stmt = do
           EDSL.retVoid
 
       | otherwise -> do
-          -- liftIO . putStrLn $ "CmmCall other"
+          -- liftIO . putStrLn $ "CmmCall other: " ++ stmt'
           s <- exprToVar blockMap regMap target
           fty <- flip fnSig live <$> (lift getDynFlags)
           f <- EDSL.intToPtr (EDSL.lift fty) s
           EDSL.tailghccall f =<< funArgs blockMap regMap live
           EDSL.retVoid
 
-    _ -> panic "Llvm.GenCode.stmtToInstrs"
+    _ -> throwE "Llvm.GenCode.stmtToInstrs"
   return res
 
 
@@ -784,6 +782,19 @@ getFunPtr ty = \case
   PrimTarget mop -> panic "getFunPtr \\w primOp"
   _              -> panic "getFunPtr, unknown case not implemented!"
 
+--------------------------------------------------------------------------------
+genAssign :: BlockMap -> RegMap -> CmmReg -> CmmExpr -> Edsl ()
+genAssign blockMap regMap reg val = do
+  slot <- lookupReg reg regMap
+  val' <- exprToVar blockMap regMap val
+  wordSize <- (*8) . wORD_SIZE <$> (lift getDynFlags)
+  let ty = EDSL.lower (EDSL.ty slot)
+  case ty of
+    Ty.Ptr _ _
+      | EDSL.ty val' == EDSL.i wordSize -> EDSL.intToPtr ty val' >>= EDSL.store slot
+    Ty.Vector _ _ -> EDSL.bitcast ty val' >>= EDSL.store slot
+    _ -> EDSL.store slot val'
+
 -- genStore --------------------------------------------------------------------
 -- TODO: WIP!
 -- | CmmStore operation
@@ -813,35 +824,53 @@ genStore blockMap regMap addrE val = case addrE of
 genStore_fast :: BlockMap -> RegMap
               -> CmmExpr -> GlobalReg -> Int -> Symbol
               -> Edsl ()
-genStore_fast blockMap regMap addr r n val = do
-  -- ptrSize (ptrs are the size of words)
-  ptrSize <- (*8) . wORD_SIZE <$> (lift getDynFlags)
-  slot <- loadGlobalReg r regMap
-  let slotTy = EDSL.ty slot
-  -- Note: n is in bytes. Hence we need to compute the actual offset
-  --       depending on the underlying structure ourself.  As the
-  --       getElementPointer works relative to the size of the
-  --       underlying structure.
-  -- we could compute the size of the element using gep.
-  -- see: http://stackoverflow.com/a/30830445
-  -- That way, we would need to insert additional blocks to
-  -- handle the slow case, as we would need to verify that there
-  -- is no remainder.
-  --
-  -- for now we will assume a pointer has the size of a word.
-      (ix, rem) = n `divMod` ((EDSL.size ptrSize slotTy) `div` 8)
-  if EDSL.isPtr slotTy && rem == 0
-    then do ptr <- EDSL.gep slot [EDSL.int32 ix]
-            -- liftIO . putStrLn $ "(genStore_fast)gep: " ++ show (pretty slot) ++ " at " ++ show ix ++ " -> " ++ show (pretty ptr)
-            EDSL.store ptr val
-    -- if its a bit type then we use the slow method since we
-    -- can't avoid casting anyway.
-    else genStore_slow blockMap regMap addr val
+genStore_fast blockMap regMap addr r n val = genStore_slow blockMap regMap addr val
+  -- -- ptrSize (ptrs are the size of words)
+  -- ptrSize <- (*8) . wORD_SIZE <$> (lift getDynFlags)
+  -- slot <- loadGlobalReg r regMap
+  -- let slotTy = EDSL.ty slot
+  -- -- Note: n is in bytes. Hence we need to compute the actual offset
+  -- --       depending on the underlying structure ourself.  As the
+  -- --       getElementPointer works relative to the size of the
+  -- --       underlying structure.
+  -- -- we could compute the size of the element using gep.
+  -- -- see: http://stackoverflow.com/a/30830445
+  -- -- That way, we would need to insert additional blocks to
+  -- -- handle the slow case, as we would need to verify that there
+  -- -- is no remainder.
+  -- --
+  -- -- for now we will assume a pointer has the size of a word.
+  --     (ix, rem) = n `divMod` ((EDSL.size ptrSize slotTy) `div` 8)
+  -- if EDSL.isPtr slotTy && rem == 0
+  --   then do ptr <- EDSL.gep slot [EDSL.int32 ix]
+  --           liftIO . putStrLn $ "(genStore_fast)gep: " ++ show (pretty slot) ++ " at " ++ show ix ++ " -> " ++ show (pretty ptr)
+  --           EDSL.store ptr val
+  --   -- if its a bit type then we use the slow method since we
+  --   -- can't avoid casting anyway.
+  --   else genStore_slow blockMap regMap addr val
 
+genStore_slow :: BlockMap -> RegMap
+              -> CmmExpr -> Symbol
+              -> Edsl ()
 genStore_slow blockMap regMap addrExpr val = do
   slot <- exprToVar blockMap regMap addrExpr
-  -- case EDSL.ty slot of
-  panic $ "genStore_slow:\n Slot: " ++ (show slot) ++ "\n  Val: " ++ (show val)
+  wordSize <- (*8) . wORD_SIZE <$> (lift getDynFlags)
+  case EDSL.ty slot of
+    -- if the slot is a ptr to a ptr, assume we want to
+    -- store the value as a ptr.
+    Ty.Ptr _ ty@(Ty.Ptr _ _)
+      | EDSL.ty val == EDSL.i wordSize -> do
+          val' <- EDSL.intToPtr ty val
+          EDSL.store slot val'
+    -- if the slot is of ptr type, try to store the value.
+    Ty.Ptr _ _ -> EDSL.store slot val
+    -- if the slot ends up being an int, assume it's the address
+    -- to be written to.
+    i@(Ty.Int _)
+      | i == EDSL.i wordSize -> do
+          slot' <- EDSL.intToPtr (EDSL.lift (EDSL.ty slot)) slot
+          EDSL.store slot' val
+    otherwise -> throwE $ "genStore: ptr not of the right type!\n Slot: " ++ (show slot) ++ "\n  Val: " ++ (show val)
 
 --------------------------------------------------------------------------------
 -- * CmmExpr code generation
@@ -853,7 +882,12 @@ exprToVar blockMap regMap = \case
   -- Read memory location
   CmmLoad e' ty      -> genLoad blockMap regMap e' ty
   -- Contents of register
-  CmmReg r           -> loadReg r regMap -- TODO, might need to cast to int, as Cmm expects ints. See getCmmReg
+  CmmReg r           -> do wordSize <- (*8) . wORD_SIZE <$> (lift getDynFlags)
+                           val <- loadReg r regMap
+                           case EDSL.ty val of
+                             -- Cmm wants the value, so pointers must be cast to ints.
+                             Ty.Ptr _ _ -> EDSL.ptrToInt (EDSL.i wordSize) val
+                             _          -> return val
   -- Machine operation
   CmmMachOp op exprs -> genMachOp blockMap regMap op exprs
   -- Expand the CmmRegOff shorthand.
@@ -868,14 +902,14 @@ exprToVar blockMap regMap = \case
 --       computing ptrToInt -> add/sub -> intToPtr.
 genLoad :: BlockMap -> RegMap -> CmmExpr -> CmmType -> Edsl Symbol
 genLoad blockMap regMap e ty = case e of
-  (CmmReg (CmmGlobal r))        -> genLoad_fast' e r 0 ty
-  (CmmRegOff (CmmGlobal r) n)   -> genLoad_fast' e r n ty
-  (CmmMachOp (MO_Add _)
-   [ (CmmReg (CmmGlobal r))
-   , (CmmLit (CmmInt n _))]) -> genLoad_fast' e r (fromInteger n) ty
-  (CmmMachOp (MO_Sub _)
-   [ (CmmReg (CmmGlobal r))
-   , (CmmLit (CmmInt n _))]) -> genLoad_fast' e r (negate $ fromInteger n) ty
+  -- (CmmReg (CmmGlobal r))        -> genLoad_fast' e r 0 ty
+  -- (CmmRegOff (CmmGlobal r) n)   -> genLoad_fast' e r n ty
+  -- (CmmMachOp (MO_Add _)
+  --  [ (CmmReg (CmmGlobal r))
+  --  , (CmmLit (CmmInt n _))]) -> genLoad_fast' e r (fromInteger n) ty
+  -- (CmmMachOp (MO_Sub _)
+  --  [ (CmmReg (CmmGlobal r))
+  --  , (CmmLit (CmmInt n _))]) -> genLoad_fast' e r (negate $ fromInteger n) ty
   _ -> genLoad_slow' e ty
   where genLoad_fast' = genLoad_fast blockMap regMap
         genLoad_slow' = genLoad_slow blockMap regMap
@@ -919,11 +953,13 @@ genLoad_slow blockMap regMap e ty = do
   ptr <- exprToVar blockMap regMap e
   e' <- showCmm e
   ty' <- showCmm ty
-  if fromCmmType ty == (EDSL.ty ptr)
-    then pure ptr
-    else if fromCmmType ty == (EDSL.lower (EDSL.ty ptr))
-         then EDSL.load ptr
-         else panic $ "genLoad_slow not implemented, expr: " ++ e' ++ "("++ ty' ++ ")" ++ " -> " ++ show ptr
+  -- liftIO . putStrLn $ "genLoad " ++ e' ++ " :: " ++ ty'
+  -- liftIO . putStrLn $ "loadSlot: " ++ show ptr
+  wordSize <- (*8) . wORD_SIZE <$> (lift getDynFlags)
+  case EDSL.ty ptr of
+    Ty.Ptr _ t   | t == fromCmmType ty  -> EDSL.load ptr
+    i@(Ty.Int _) | i == EDSL.i wordSize -> EDSL.intToPtr (EDSL.lift (EDSL.ty ptr)) ptr >>= EDSL.load
+    otherwise                           -> throwE $ "genLoad_slow not implemented, expr: " ++ e' ++ "("++ ty' ++ ")" ++ " -> " ++ show ptr
 
 genMachOp :: BlockMap -> RegMap -> MachOp -> [CmmExpr] -> Edsl Symbol
 genMachOp blockMap regMap op [x] = panicOp
@@ -944,12 +980,16 @@ genMachOp blockMap regMap op e = genMachOp_slow blockMap regMap op e
 
 genMachOp_fast blockMap regMap op r n e = do
   -- See genStore_fast
+  e'  <- showCmm e
+  -- liftIO . putStrLn $ "genMachOp: " ++ show op ++ " - " ++ e'
   ptrSize <- (*8) <$> wORD_SIZE <$> (lift getDynFlags)
   slot <- loadGlobalReg r regMap
   let slotTy = EDSL.ty slot
       (ix, rem) = n `divMod` ((EDSL.size ptrSize slotTy) `div` 8)
   if EDSL.isPtr slotTy && rem == 0
-    then EDSL.gep slot [EDSL.int32 ix]
+    -- We are performing ADD or SUB, hence this would otherwise be:
+    -- see also the exprToVar for CmmReg.
+    then EDSL.gep slot [EDSL.int32 ix] >>= EDSL.ptrToInt (EDSL.i ptrSize)
     else genMachOp_slow blockMap regMap op e
 
 -- | Handle CmmMachOp expressions
@@ -984,20 +1024,20 @@ genMachOp_slow blockMap regMap op [x, y] = case op of
       rhs <- exprToVar blockMap regMap y
       EDSL.islt lhs rhs
     MO_S_Le _ -> do
-      lhs <- lowerIfNeeded =<< exprToVar blockMap regMap x
-      rhs <- lowerIfNeeded =<< exprToVar blockMap regMap y
+      lhs <- exprToVar blockMap regMap x
+      rhs <- exprToVar blockMap regMap y
       EDSL.isle lhs rhs
     MO_U_Gt _ -> do
-      lhs <- lowerIfNeeded =<< exprToVar blockMap regMap x
-      rhs <- lowerIfNeeded =<< exprToVar blockMap regMap y
+      lhs <- exprToVar blockMap regMap x
+      rhs <- exprToVar blockMap regMap y
       EDSL.iugt lhs rhs
     MO_U_Ge _ -> do
       lhs <- exprToVar blockMap regMap x
       rhs <- exprToVar blockMap regMap y
       EDSL.iuge lhs rhs
     MO_U_Lt _ -> do
-      lhs <- lowerIfNeeded =<< exprToVar blockMap regMap x
-      rhs <- lowerIfNeeded =<< exprToVar blockMap regMap y
+      lhs <- exprToVar blockMap regMap x
+      rhs <- exprToVar blockMap regMap y
       EDSL.iult lhs rhs
     MO_U_Le _ -> do
       lhs <- exprToVar blockMap regMap x
@@ -1005,8 +1045,8 @@ genMachOp_slow blockMap regMap op [x, y] = case op of
       EDSL.iule lhs rhs
 
     MO_Add _ -> do
-      lhs <- lowerIfNeeded =<< exprToVar blockMap regMap x
-      rhs <- lowerIfNeeded =<< exprToVar blockMap regMap y
+      lhs <- exprToVar blockMap regMap x
+      rhs <- exprToVar blockMap regMap y
       EDSL.add lhs rhs
     MO_Sub _ -> do
       lhs <- exprToVar blockMap regMap x
@@ -1094,9 +1134,6 @@ genMachOp_slow blockMap regMap op [x, y] = case op of
 
     _            -> panicOp
     where
-      lowerIfNeeded :: Symbol -> Edsl Symbol
-      lowerIfNeeded x | EDSL.isPtr (EDSL.ty x) = EDSL.ptrToInt (EDSL.lower (EDSL.ty x)) x
-                      | otherwise = return x
       panicOp = panic $ "LLVM.CodeGen.genMachOp_slow: unary op encountered"
                 ++ "with two arguments! (" ++ show op ++ ")"
 

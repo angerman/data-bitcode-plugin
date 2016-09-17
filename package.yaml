@@ -18,6 +18,8 @@ dependencies:
   - data-bitcode-edsl
   - data-bitcode-llvm
   - transformers
+  - directory
+  - filepath
 
 library:
   source-dirs: src

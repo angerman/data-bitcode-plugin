@@ -16,7 +16,7 @@ import Cmm.Pretty
 
 import DynFlags
 
-import Data.BitCode.LLVM.Gen (outputFn, phaseInputExt)
+import Data.BitCode.Hooks (outputFn, phaseInputExt, phaseHook)
 
 --------------------------------------------------------------------------------
 -- WARN: Do *not* define any symbols here that might conflict with GHC Symbols
@@ -43,8 +43,9 @@ installHook _ dflags = traceShow "..." $ dflags { hooks = addHook (hooks dflags)
                                                 , hscTarget = HscLlvm
                                                 }
   where
-    addHook h = h { codeOutputHook = Just outputFn
+    addHook h = h { codeOutputHook    = Just outputFn
                   , phaseInputExtHook = Just phaseInputExt
+                  , runPhaseHook      = Just phaseHook
                   }
 
 -- We are a plugin!

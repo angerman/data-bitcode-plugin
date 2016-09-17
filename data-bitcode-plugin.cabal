@@ -31,8 +31,11 @@ library
     , data-bitcode-edsl
     , data-bitcode-llvm
     , transformers
+    , directory
+    , filepath
   exposed-modules:
       Cmm.Pretty
+      Data.BitCode.Hooks
       Data.BitCode.LLVM.Gen
       Data.BitCode.LLVM.Gen.Monad
       Data.BitCode.Plugin
