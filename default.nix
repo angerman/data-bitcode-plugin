@@ -1,8 +1,16 @@
-{ nixpkgs ? import <nixpkgs> {} }:
-let
- ghc = (nixpkgs.callPackage ./ghc {}).pluginGhc;
- data-bitcode = ghc.callPackage ./data-bitcode { };
- data-bitcode-llvm = ghc.callPackage ./data-bitcode-llvm { inherit data-bitcode; };
- data-bitcode-edsl = ghc.callPackage ./data-bitcode-edsl { inherit data-bitcode data-bitcode-llvm; };
-in
- ghc.callPackage  ./data-bitcode-plugin.nix { inherit data-bitcode-edsl data-bitcode-llvm; }
+{ mkDerivation, base, base16-bytestring, binary, bytestring
+, data-bitcode-edsl, data-bitcode-llvm, directory, filepath, ghc
+, pretty, stdenv, transformers
+}:
+mkDerivation {
+  pname = "data-bitcode-plugin";
+  version = "0.1.0.0";
+  src = ./.;
+  libraryHaskellDepends = [
+    base base16-bytestring binary bytestring data-bitcode-edsl
+    data-bitcode-llvm directory filepath ghc pretty transformers
+  ];
+  homepage = "https://github.com/angerman/data-bitcode-plugin#readme";
+  description = "bitcode plugin for ghc";
+  license = stdenv.lib.licenses.bsd3;
+}
