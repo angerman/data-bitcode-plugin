@@ -7,16 +7,7 @@ as a result.
 
 ### via nix
 
-`ghc/head.nix` contains a slimed down version of the official `head.nix` ghc expression.
-`ghc/ghc.nix` contains a custom ghc derivation with `-llvm` and the improved plugin interface.
-
-`ghc/default.nix` right now simply builds the `ghc` as specified in `base.nix`. (TODO: use `ghc.nix`)
-
-Running
-```
-nix-shell -p '(pkgs.callPackage ./ghc/default.nix {})'
-```
-will hence drop you into a nix-shell with ghc available.
+See [data-bitcode-plugin-env](https://github.com/angerman/data-bitcode-plugin-env).
 
 ### via stack
 
