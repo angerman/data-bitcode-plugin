@@ -1,9 +1,17 @@
 { nixpkgs ? import <nixpkgs> {}, ... } @ args:
-let ghcBase = custom: nixpkgs.callPackage ./base.nix (args // custom); in
+let
+  commonArgs = { bootPkgs = nixpkgs.haskell.packages.ghc802;
+                 inherit (nixpkgs.haskellPackages) happy alex;
+               };
+  ghcBase = custom: nixpkgs.callPackage <nixpkgs/pkgs/development/haskell-modules> {
+    ghc = nixpkgs.callPackage ./base.nix (args // commonArgs // custom);
+    compilerConfig = nixpkgs.callPackage ./configuration-ghc.nix {};
+  };
+in
 { ghc81 = ghcBase {
-   ghcVersion = "8.1.20161115";
-   ghcRevision = "017d11e0a36866b05ace32ece1af11adf652a619";
-   ghcSha256 = "1ryggmz961qd0fl50rkjjvi6g9azwla2vx9310a9nzjaj5x6ib4y";
+    ghcVersion = "8.1.20161115";
+    ghcRevision = "017d11e0a36866b05ace32ece1af11adf652a619";
+    ghcSha256 = "1ryggmz961qd0fl50rkjjvi6g9azwla2vx9310a9nzjaj5x6ib4y";
   };
   pluginGhc = ghcBase {
     ghcVersion  = "8.1.20161211";
