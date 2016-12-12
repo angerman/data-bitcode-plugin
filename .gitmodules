@@ -1,0 +1,12 @@
+[submodule "data-bitcode-edsl"]
+	path = data-bitcode-edsl
+	url = git@github.com:angerman/data-bitcode-edsl.git
+	branch = master
+[submodule "data-bitcode"]
+	path = data-bitcode
+	url = git@github.com:angerman/data-bitcode.git
+	branch = master
+[submodule "data-bitcode-llvm"]
+	path = data-bitcode-llvm
+	url = git@github.com:angerman/data-bitcode-llvm.git
+	branch = master
