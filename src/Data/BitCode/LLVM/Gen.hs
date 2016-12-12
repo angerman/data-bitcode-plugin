@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, GeneralizedNewtypeDeriving, RecursiveDo, LambdaCase, FlexibleInstances, FlexibleContexts, StandaloneDeriving #-}
+{-# LANGUAGE GADTs, GeneralizedNewtypeDeriving, RecursiveDo, LambdaCase, FlexibleInstances, FlexibleContexts, StandaloneDeriving, BangPatterns #-}
 module Data.BitCode.LLVM.Gen where
 
 import qualified Data.BitCode.LLVM.Gen.Monad as Llvm
@@ -27,7 +27,6 @@ import Control.Monad.Trans.State
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.Except (runExceptT, ExceptT, throwE, catchE)
 
-
 import Outputable as Outp hiding ((<+>), text, ($+$), int)
 
 import qualified Stream
@@ -45,6 +44,7 @@ import CodeGen.Platform ( activeStgRegs, callerSaves )
 import ForeignCall
 
 import DynFlags
+import Plugins (CommandLineOption)
 
 -- body builder
 import Data.BitCode.LLVM.Instruction (Inst)
@@ -73,19 +73,17 @@ newtype LlvmM a = LlvmM { unLlvmM :: LlvmT IO a }
 instance HasDynFlags LlvmM where
   getDynFlags = LlvmM $ getDynFlags
 
-runLlvm :: DynFlags -> FilePath -> LlvmM [Either Symbol Func.Function] -> IO ()
-runLlvm dflags fp m = do
+runLlvm :: [CommandLineOption] -> DynFlags -> FilePath -> LlvmM [Either Symbol Func.Function] -> IO ()
+runLlvm opts dflags fp m = do
   putStrLn $ "Output File: " ++ fp
-  decls <- flip evalStateT env (runLlvmT (unLlvmM m))
-  let mod = EDSL.mod' "anon" (lefts decls) (rights decls)
-  -- stop here for now!
---  error . show $ pretty mod
+  putStrLn $ "CommandLineOptions: " ++ show opts
+  decls <- {-# SCC "module_gen_decls" #-} flip evalStateT env (runLlvmT (unLlvmM m))
+  let mod = {-# SCC "module_building" #-} EDSL.mod' "anon" (lefts decls) (rights decls)
 
-  -- TODO: FLAGS: if -drump-ast
-  -- liftIO . putStrLn $ show (pretty mod)
+  when ("-dump-ast" `elem` opts)    $ liftIO . putStrLn . show . pretty $ mod
+  when ("-dump-module" `elem` opts) $ EDSL.dumpModuleBitcodeAST (fp ++ "bin") mod
 
-  EDSL.writeModule fp mod
-  putStrLn $ "Wrote " ++ fp
+  _ <- {-# SCC "module_write" #-} EDSL.writeModule fp mod
   return ()
   where env = LlvmEnv { envDynFlags = dflags }
 
@@ -118,12 +116,10 @@ showCmm cmm = (\dflags -> showSDoc dflags (ppr cmm)) <$> getDynFlags
 
 llvmCodeGen :: Stream.Stream LlvmM RawCmmGroup () -> LlvmM [Either Symbol Func.Function]
 llvmCodeGen cmm_stream = do
-  liftIO $ putStrLn $ "llvmCodeGen..."
   -- The cmm stream contains multiple groups.
   --
   -- each group consists of a set of data and procs.
   fns <- Stream.collect $ Stream.mapM llvmGroupGen cmm_stream
-  liftIO $ putStrLn $ "done with llvmCodeGen"
   -- as we want to put all these data and procs into a single module
   -- we simply concat the result of the stream.
   return $ concat fns
@@ -962,9 +958,29 @@ genLoad_slow blockMap regMap e ty = do
     otherwise                           -> throwE $ "genLoad_slow not implemented, expr: " ++ e' ++ "("++ ty' ++ ")" ++ " -> " ++ show ptr
 
 genMachOp :: BlockMap -> RegMap -> MachOp -> [CmmExpr] -> Edsl Symbol
-genMachOp blockMap regMap op [x] = panicOp
-  -- case op of
-  -- _        -> panicOp
+genMachOp blockMap regMap op [x] = case op of
+  MO_Not   w -> EDSL.xor (EDSL.int (widthInBits w) (-1))   =<< exprToVar blockMap regMap x
+  MO_S_Neg w -> EDSL.sub (EDSL.int (widthInBits w) 0)      =<< exprToVar blockMap regMap x
+  MO_F_Neg w -> EDSL.sub (EDSL.float (widthInBits w) (-0)) =<< exprToVar blockMap regMap x
+
+  -- MO_SF_Conv _ w ->
+  -- MO_FS_Conv
+
+  -- MO_SS_Conv
+  MO_UU_Conv from to | widthInBits from < widthInBits to -> exprToVar blockMap regMap x >>= \case
+                         x | EDSL.ty x == targetTy -> return x
+                         x                         -> EDSL.zext targetTy x
+                     | widthInBits from > widthInBits to -> EDSL.trunc (EDSL.i (widthInBits to)) =<< exprToVar blockMap regMap x
+                     -- converting from and to the same is the identity.
+                     | otherwise                         -> exprToVar blockMap regMap x
+    where targetTy = EDSL.i (widthInBits to)
+
+  -- MO_FF_Conv
+
+  -- MO_VS_Neg
+  -- MO_VF_Neg
+
+  _        -> panicOp
   where panicOp = panic $ "LLVM.CodeGen.genMachOp: non unary op encountered"
                        ++ "with one argument! (" ++ show op ++ ")"
 
@@ -1090,8 +1106,15 @@ genMachOp_slow blockMap regMap op [x, y] = case op of
     -- MO_F_Mul  _ -> genBinMach LM_MO_FMul
     -- MO_F_Quot _ -> genBinMach LM_MO_FDiv
 
-    -- MO_And _   -> genBinMach LM_MO_And
-    -- MO_Or  _   -> genBinMach LM_MO_Or
+    MO_And _   -> do
+      lhs <- exprToVar blockMap regMap x
+      rhs <- exprToVar blockMap regMap y
+      EDSL.and lhs rhs
+
+    MO_Or  _   -> do
+      lhs <- exprToVar blockMap regMap x
+      rhs <- exprToVar blockMap regMap y
+      EDSL.or lhs rhs
     -- MO_Xor _   -> genBinMach LM_MO_Xor
     -- MO_Shl _   -> genBinMach LM_MO_Shl
     -- MO_U_Shr _ -> genBinMach LM_MO_LShr

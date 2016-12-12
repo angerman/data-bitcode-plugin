@@ -9,6 +9,7 @@ import Stream           (Stream)
 import Module
 import DynFlags
 import Cmm
+import Plugins (CommandLineOption)
 -- for phaseInputExt
 import DriverPhases (Phase(..))
 import DriverPipeline
@@ -18,22 +19,31 @@ import Control.Monad.IO.Class (liftIO)
 import Data.Maybe (isJust)
 import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory)
+import qualified Stream
+
+type Hook' a = a -> a
 
 --------------------------------------------------------------------------------
 -- Plugin Hook
-outputFn :: (DynFlags -> Module -> ModLocation -> FilePath -> Stream IO RawCmmGroup () -> [UnitId] -> IO ())
-         -> DynFlags -> Module -> ModLocation -> FilePath -> Stream IO RawCmmGroup () -> [UnitId] -> IO ()
-outputFn super dflags mod mloc fp cmm_stream pkg_deps = runLlvm dflags fp $ llvmCodeGen (Llvm.liftStream cmm_stream)
+outputFn :: [CommandLineOption] -> Hook' (DynFlags -> Module -> ModLocation -> FilePath -> Stream IO RawCmmGroup () -> [InstalledUnitId] -> IO ())
+outputFn opts super dflags mod mloc fp cmm_stream pkg_deps = do
+  elms <- Stream.collect cmm_stream
+  runLlvm opts dflags fp $ llvmCodeGen (Llvm.liftStream cmm_stream)
+  -- super reinitGlobals dflags mod mloc fp cmm_stream pkg_deps
 
-phaseInputExt :: (Phase -> String) -> Phase -> String
+phaseInputExt :: Hook' (Phase -> String)
 phaseInputExt super = \case
   LlvmOpt    -> "bc"
   (As _)     -> "bc"
   p -> super p
 
-phaseHook :: (PhasePlus -> FilePath -> DynFlags -> CompPipeline (PhasePlus, FilePath))
-          -> PhasePlus -> FilePath -> DynFlags -> CompPipeline (PhasePlus, FilePath)
+phaseHook :: Hook' (PhasePlus -> FilePath -> DynFlags -> CompPipeline (PhasePlus, FilePath))
 phaseHook super phase input_fn dflags = case phase of
+  -- ensure we use clang to compile C code. And also make sure it emits bitcode.
+  -- the default impl will pass -S to generate assembly, luckily that option is
+  -- ignored if we pass -emit-llvm first. Yes. This. Is. A. Hack!
+  (RealPhase Cc) -> let (p,args0) = pgm_c dflags
+                    in super phase input_fn (dflags { settings = (settings dflags) { sPgm_c = ("clang", (Option "-emit-llvm"):args0) } })
   -- Optimization phase
   (RealPhase LlvmOpt) -> do
     -- we skip Llc and Mangle;

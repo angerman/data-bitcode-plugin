@@ -20,6 +20,8 @@ dependencies:
   - transformers
   - directory
   - filepath
+  - binary
+  - hoopl
 
 library:
   source-dirs: src
