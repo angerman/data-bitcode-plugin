@@ -11,15 +11,6 @@ import Hoopl
 
 import Text.PrettyPrint
 
-ppDecl :: GenCmmDecl CmmStatics (BlockEnv CmmStatics) CmmGraph -> IO ()
-ppDecl (CmmProc hdr lbl regs graph) = putStrLn $ show $ text "Proc" <+> (ppLabel lbl <+> (if externallyVisibleCLabel lbl then text "Extern" else text "Intern")
-                                                                         $+$ ppProcGraph graph
-                                                                        )
-ppDecl (CmmData (Section t l) (Statics l2 statics))
-  = putStrLn $ show $ text (show t) <+> (ppLabel l <+> (if externallyVisibleCLabel l then text "Extern" else text "Intern")
-    $+$ ppLabel l2 <+> text ":" <+> int (length statics) <+> text "els:") <+> ppStatics statics
-
-
 --------------------------------------------------------------------------------
 -- Data (CmmStatics)
 ppStatics :: [CmmStatic] -> Doc
